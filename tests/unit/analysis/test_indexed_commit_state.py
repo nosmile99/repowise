@@ -15,8 +15,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 from repowise.core.analysis.test_collection import _indexed_commit
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
