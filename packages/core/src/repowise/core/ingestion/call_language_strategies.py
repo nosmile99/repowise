@@ -52,7 +52,8 @@ class _LanguageCallStrategies:
     call chained on another call (``a.b().c()``) alone, which is resolved by
     its inner call's return type or not at all. ``inherited_typed_receiver`` lets a typed
     receiver whose type lacks the method answer with the one ancestor that
-    declares it.
+    declares it; ``inherited_fields`` lets a receiver be typed from a field an
+    ancestor declares.
     """
 
     free: tuple[str, ...] = ()
@@ -63,6 +64,7 @@ class _LanguageCallStrategies:
     member_bare_fallback: bool = True
     chain_bare_fallback: bool = True
     inherited_typed_receiver: bool = False
+    inherited_fields: bool = False
 
 
 _NO_LANGUAGE_STRATEGIES = _LanguageCallStrategies()
@@ -115,10 +117,12 @@ _JVM_STRATEGIES = _LanguageCallStrategies(
 # `obj->m()` is looked for in the caller's own file, in what it includes, and
 # then in the global pair index. `c` shares this object and is excluded a layer
 # up instead: it is absent from `_LANGUAGE_PATTERNS`, and a struct declares no
-# method for the pair index to hold.
+# method for the pair index to hold. A field a base class declares types a
+# receiver as an own one does (``lexer_.ReadToken()`` in a derived parser).
 _CPP_STRATEGIES = _LanguageCallStrategies(
     free=("_resolve_cpp_scoped_call", "_resolve_cpp_same_target"),
     member_fallback=_TYPED_RECEIVER,
+    inherited_fields=True,
 )
 
 # Rust's crate-root strategy is deliberately absent: it runs for every language
@@ -144,14 +148,20 @@ _LANGUAGE_CALL_STRATEGIES: dict[str, _LanguageCallStrategies] = {
         member_fallback=_TYPED_RECEIVER,
         member_bare_fallback=False,
         inherited_typed_receiver=True,
+        inherited_fields=True,
     ),
     # A chained call keeps no bare-name fallback: ``.send()`` on a result the
     # return type does not type is not the repo's ``send``.
     "kotlin": replace(
-        _JVM_STRATEGIES, member_fallback=_TYPED_RECEIVER, chain_bare_fallback=False
+        _JVM_STRATEGIES,
+        member_fallback=_TYPED_RECEIVER,
+        chain_bare_fallback=False,
+        inherited_typed_receiver=True,
     ),
     "csharp": _LanguageCallStrategies(
-        free_fallback=("_resolve_csharp_constructed_type",), member_fallback=_TYPED_RECEIVER
+        free_fallback=("_resolve_csharp_constructed_type",),
+        member_fallback=_TYPED_RECEIVER,
+        inherited_fields=True,
     ),
     "python": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
     # Swift and Dart register the fallback: neither has a package tier of its
@@ -168,8 +178,8 @@ _LANGUAGE_CALL_STRATEGIES: dict[str, _LanguageCallStrategies] = {
     ),
     # TypeScript's typed fallback also walks a dotted receiver's fields.
     "typescript": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
-    # Rust types a local or parameter only; a `self.field` receiver is not
-    # walked, since Rust has no `_CHAIN_SELF` row.
+    # Rust types a local or parameter, and walks a `self.field` receiver
+    # through the struct's field declarations.
     "rust": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
     "cpp": _CPP_STRATEGIES,
     "c": _CPP_STRATEGIES,
@@ -180,6 +190,7 @@ _LANGUAGE_CALL_STRATEGIES: dict[str, _LanguageCallStrategies] = {
         member_fallback=_TYPED_RECEIVER,
         member_bare_fallback=False,
         inherited_typed_receiver=True,
+        inherited_fields=True,
     ),
 }
 
@@ -385,7 +396,8 @@ class LanguageStrategiesMixin:
             sym_id = candidates[0][1]
         else:
             return None
-        if sym_id == caller_id:
+        # The qualifier names the caller's own class: recursion, when nothing else answers to the id.
+        if self._refuses_recursion(sym_id, caller_id, call):
             return None
         return ResolvedCall(caller_id, sym_id, 0.93, call.line, "scoped_name")
 
@@ -966,6 +978,28 @@ class LanguageStrategiesMixin:
             return None
         type_id, origin, confidence = found
         return self._csharp_type_call(type_id, caller_id, call, origin, confidence)
+
+    def _csharp_constructed_type_is_ambiguous(self, file_path: str, call: CallSite) -> bool:
+        """Whether ``new Name<T>(..)`` sees multiple types at its first lookup level."""
+        name = call.target_name
+        if call.receiver_name or name not in self._csharp_type_names:
+            return False
+        arity = self._constructed_arity(file_path, call)
+        if arity is None:
+            return False
+        aliases, levels = self._csharp_lookup(file_path)
+        if name in aliases:
+            return False
+        types = [
+            (namespace, type_id)
+            for namespace, type_id, type_arity in self._csharp_constructible_types(name)
+            if type_arity == arity
+        ]
+        for level, _origin, _confidence in levels:
+            visible = [type_id for namespace, type_id in types if namespace in level]
+            if visible:
+                return len(visible) > 1
+        return False
 
     def _constructed_arity(self, file_path: str, call: CallSite) -> int | None:
         """How many type arguments *call*'s line writes after ``new Name``, None for no ``new``.

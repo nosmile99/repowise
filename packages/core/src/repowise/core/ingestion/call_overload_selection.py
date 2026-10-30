@@ -7,9 +7,10 @@ member by argument count, then by the typed arguments (Java's most-specific rule
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from functools import cache
+from types import MappingProxyType
 
 from .call_receiver_typing import _FUNCTION_KINDS, _TYPE_KINDS
 from .language_data import get_builtin_types
@@ -25,6 +26,10 @@ from .symbol_identity import (
     parameter_type_arity,
     split_symbol_id,
 )
+
+# Languages whose prototypes and bodies pair member by member, and whose
+# ``static`` (or anonymous-namespace) symbols no other translation unit sees.
+C_LINKAGE_LANGUAGES = ("c", "cpp", "objectivec")
 
 
 def _overload_phase(admitted: tuple[int, int | None], argument_count: int) -> int | None:
@@ -97,42 +102,140 @@ _JAVA_LITERAL_LEVELS: dict[str, dict[str, int]] = {
 _UNJUDGED_LEVEL = {**dict.fromkeys(_JAVA_WIDENING, 2), "String": 1, "null": 1}
 
 
-def _argument_fit(parameter: str, argument: str) -> int | None:
+_NO_REPO_TYPES: Mapping[str, bool] = MappingProxyType({})
+
+
+def _argument_fit(
+    parameter: str, argument: str, repo_types: Mapping[str, bool] = _NO_REPO_TYPES
+) -> int | None:
     """How near a Java argument reaches *parameter*: 0 exactly, 1 widened, 2 boxed; None never.
 
     *argument* is a literal's type or a named argument's declared one; a
     named ``String`` or primitive takes the literal path. A coarse form of the
     most-specific rule: a call ``f(true)`` takes ``f(boolean)`` over
-    ``f(Object)``, and ``f('c')`` takes ``f(int)`` over it.
+    ``f(Object)``, and ``f('c')`` takes ``f(int)`` over it. *repo_types*
+    says which repository type names are interfaces, for a lambda.
     """
+    if argument.startswith("->"):
+        return _lambda_fit(parameter, argument, repo_types)
+    if argument == "Class" and parameter.rstrip("?") == "Class":
+        # ``Class<?>`` erases to ``Class?``; a class literal fits it exactly.
+        return 0
     levels = _JAVA_LITERAL_LEVELS.get(argument)
     if levels is None:
-        return _reference_fit(parameter, argument)
+        return _reference_fit(parameter, argument, repo_types)
     if parameter.endswith("[]"):
         return 1 if argument == "null" else None
     if parameter not in _JAVA_JUDGED_PARAMETERS:
-        return _UNJUDGED_LEVEL[argument]
+        return _unjudged_literal_fit(parameter, argument, repo_types)
     return levels.get(parameter)
 
 
-def _reference_fit(parameter: str, argument: str) -> int | None:
+def _unjudged_literal_fit(parameter: str, argument: str, repo_types: Mapping[str, bool]) -> int | None:
+    """A literal reaching a class parameter: by boxing, or as a String; None where its class cannot."""
+    boxed = _JAVA_BOXES.get(argument, argument)
+    if argument != "null" and not _final_may_reach(parameter, boxed, repo_types):
+        return None
+    return _UNJUDGED_LEVEL[argument]
+
+
+# JDK functional interfaces: (parameter count, whether the function returns a value).
+_JAVA_FUNCTIONAL_SHAPES = {
+    "Runnable": (0, False), "Callable": (0, True), "Supplier": (0, True),
+    "Consumer": (1, False), "Function": (1, True), "Predicate": (1, True),
+    "UnaryOperator": (1, True), "BiConsumer": (2, False), "BiFunction": (2, True),
+    "BiPredicate": (2, True), "BinaryOperator": (2, True), "Comparator": (2, True),
+}
+
+
+def _lambda_fit(parameter: str, argument: str, repo_types: Mapping[str, bool]) -> int | None:
+    """How a lambda of shape ``->N:value|void|either`` reaches *parameter*.
+
+    0 for a JDK functional interface of that shape, None for one of another
+    shape or a type no lambda targets, 1 for any other interface, which may
+    be a repository functional interface of the right shape. A body that
+    suits both reaches a void interface at 1, so the value-returning one
+    wins, as the most-specific rule has it.
+    """
+    count, _, result = argument[2:].partition(":")
+    shape = _JAVA_FUNCTIONAL_SHAPES.get(parameter)
+    if shape is not None:
+        takes, returns = shape
+        if takes != int(count):
+            return None
+        if result == "either":
+            return 0 if returns else 1
+        return 0 if returns == (result == "value") else None
+    return 1 if _may_take_lambda(parameter, repo_types) else None
+
+
+def _may_take_lambda(parameter: str, repo_types: Mapping[str, bool]) -> bool:
+    """Whether *parameter* may be a functional interface: a lambda converts to no class.
+
+    A repository name answers by its kind (*repo_types*); any other name
+    may be a library interface unless it is a known JDK class.
+    """
+    if parameter in repo_types:
+        return repo_types[parameter]
+    return parameter not in _NO_LAMBDA_TARGETS and not parameter.endswith("[]")
+
+
+# Parameter types no lambda converts to: primitives and the JDK classes a
+# parameter commonly names.
+_NO_LAMBDA_TARGETS = _JAVA_PRIMITIVES | _JAVA_FINAL_PARAMETERS | frozenset(
+    {"Object", "", "Class", "Enum", "Record", "Number", "Void", "Thread", "Throwable",
+     "Exception", "RuntimeException", "Error", "StringBuilder", "StringBuffer", "Optional",
+     "ArrayList", "LinkedList", "HashMap", "LinkedHashMap", "TreeMap", "HashSet",
+     "LinkedHashSet", "TreeSet", "ArrayDeque", "CompletableFuture"}
+)
+
+
+# The supertypes every String and box shares, and the one each adds.
+_JAVA_FINAL_SUPERTYPES = frozenset({"Object", "Comparable", "Serializable", "Constable"})
+_JAVA_OWN_SUPERTYPE = {
+    "String": "CharSequence",
+    **{box: "Number" for box in _JAVA_UNBOXED if box not in ("Boolean", "Character")},
+}
+
+
+# JDK types a parameter commonly names; a String or a box reaches only its supertypes among them.
+_JAVA_KNOWN_TYPES = _NO_LAMBDA_TARGETS | frozenset(
+    {"CharSequence", "Collection", "List", "Set", "Map", "Iterable", "Iterator", "Queue",
+     "Deque", "Stream", "SortedSet", "SortedMap", "NavigableSet", "NavigableMap",
+     *_JAVA_FUNCTIONAL_SHAPES}
+)
+
+
+def _reference_fit(
+    parameter: str, argument: str, repo_types: Mapping[str, bool] = _NO_REPO_TYPES
+) -> int | None:
     """How a value of class or array type *argument* reaches *parameter*.
 
     0 as itself; 2 unboxed, 3 unboxed and widened; None where it never can
-    (a primitive, another final class, an array it is not). An array reaches
-    a covariant array at 1 and anything else (``Object``) at 2. Any other
-    parameter may be a supertype or a type variable: 1, which an exact
-    match beats and nothing else tells apart.
+    (a primitive, another final class, an array it is not, or a known type
+    that is no supertype of a String or a box). An array reaches a covariant
+    array at 1 and anything else (``Object``) at 2. Any other parameter may
+    be a supertype or a type variable: 1, which an exact match beats and
+    nothing else tells apart.
     """
     if parameter == argument:
         return 0
     if parameter in _JAVA_PRIMITIVES:
         return _unboxed_fit(parameter, argument)
     if argument.endswith("[]"):
-        return _array_fit(parameter, argument)
+        return _array_fit(parameter, argument, repo_types)
     if parameter in _JAVA_FINAL_PARAMETERS or parameter.endswith("[]"):
         return None
+    if argument in _JAVA_FINAL_PARAMETERS and not _final_may_reach(parameter, argument, repo_types):
+        return None
     return 1
+
+
+def _final_may_reach(parameter: str, argument: str, repo_types: Mapping[str, bool]) -> bool:
+    """Whether a String or box *argument* may reach *parameter*: a supertype or a type variable."""
+    if parameter in _JAVA_FINAL_SUPERTYPES or parameter == _JAVA_OWN_SUPERTYPE.get(argument):
+        return True
+    return parameter not in _JAVA_KNOWN_TYPES and parameter not in repo_types
 
 
 def _unboxed_fit(parameter: str, argument: str) -> int | None:
@@ -143,21 +246,33 @@ def _unboxed_fit(parameter: str, argument: str) -> int | None:
     return 2 if parameter == unboxed else 3
 
 
-def _array_fit(parameter: str, argument: str) -> int | None:
+# The supertypes of every array type.
+_JAVA_ARRAY_SUPERTYPES = frozenset({"Object", "Cloneable", "Serializable"})
+
+
+def _array_fit(
+    parameter: str, argument: str, repo_types: Mapping[str, bool] = _NO_REPO_TYPES
+) -> int | None:
     """``String[]`` reaches ``Object[]`` (1, covariance) and ``Object`` (2).
 
-    A primitive array reaches no other array, and no array a final class.
+    A primitive array reaches no other array, and no known type but an
+    array's supertypes; an unknown name may be a type variable.
     """
     if not parameter.endswith("[]"):
-        return None if parameter in _JAVA_FINAL_PARAMETERS else 2
+        if not parameter or parameter in _JAVA_ARRAY_SUPERTYPES:
+            return 2
+        return None if parameter in _JAVA_KNOWN_TYPES or parameter in repo_types else 2
     element, takes = argument.removesuffix("[]"), parameter.removesuffix("[]")
     if element in _JAVA_PRIMITIVES or takes in _JAVA_PRIMITIVES:
         return None
-    return None if _argument_fit(takes, element) is None else 1
+    return None if _argument_fit(takes, element, repo_types) is None else 1
 
 
 def _closest_fit(
-    members: list[tuple[str, list[str]]], argument_types: tuple[str | None, ...], expanded: bool
+    members: list[tuple[str, list[str]]],
+    argument_types: tuple[str | None, ...],
+    expanded: bool,
+    repo_types: Mapping[str, bool] = _NO_REPO_TYPES,
 ) -> str | None:
     """The one member the typed arguments fit most closely, or None on a tie.
 
@@ -170,7 +285,9 @@ def _closest_fit(
     ranked: dict[int, list[str]] = defaultdict(list)
     for member, parameters in members:
         fits = [
-            _argument_fit(_parameter_taking(parameters, argument_types, index, expanded), argument)
+            _argument_fit(
+                _parameter_taking(parameters, argument_types, index, expanded), argument, repo_types
+            )
             for index, argument in enumerate(argument_types)
             if argument is not None
         ]
@@ -231,6 +348,30 @@ def _exact_apex_fit(
         return _apex_may_take(parameter, argument, repo_types)
 
     return None if any(takes(parameters, may_take) for parameters in others) else exact[0]
+
+
+def _exact_kotlin_fit(
+    members: list[tuple[str, list[str]]], argument_types: tuple[str | None, ...]
+) -> str | None:
+    """The one Kotlin member whose parameters are exactly the typed arguments' types.
+
+    Kotlin converts no argument implicitly, and of the members an argument
+    could reach through a supertype the exact one is the most specific, so
+    an exact match decides. Only where the members agree on every untyped
+    argument, which may be one the exact member cannot take. An ``Any``
+    argument is left out: a smart cast may have narrowed it.
+    """
+    if not _untyped_agree(members, argument_types, False):
+        return None
+    typed = [(index, argument.rstrip("?")) for index, argument in enumerate(argument_types) if argument]
+    if any(argument == "Any" for _, argument in typed):
+        return None
+    exact = [
+        member
+        for member, parameters in members
+        if all(index < len(parameters) and parameters[index].rstrip("?") == argument for index, argument in typed)
+    ]
+    return exact[0] if len(exact) == 1 else None
 
 
 def _apex_may_take(parameter: str, argument: str, repo_types: frozenset[str]) -> bool:
@@ -313,6 +454,19 @@ def _kotlin_function_refusing(symbol: Symbol | None, argument_count: int | None)
         admitted = signature_parameter_range(symbol.signature or "", "kotlin")
         return admitted is not None and admitted[1] is not None and argument_count > admitted[1]
     return not _takes(symbol, argument_count)
+
+
+def _could_recurse(symbol: Symbol | None, argument_count: int | None) -> bool:
+    """Whether a call of *argument_count* arguments to *symbol*'s own name may be *symbol*.
+
+    Not where arity binds (Java, C#, C++, Kotlin) and *symbol* cannot take the
+    count: the call means another overload of the name, an inherited one.
+    """
+    if symbol is None or argument_count is None:
+        return True
+    if symbol.language == "kotlin":
+        return not _kotlin_function_refusing(symbol, argument_count)
+    return symbol.language not in ("java", "csharp", "cpp") or _takes(symbol, argument_count)
 
 
 def _takes(symbol: Symbol, argument_count: int) -> bool:
@@ -443,18 +597,19 @@ class OverloadSelectionMixin:
     def _pair_overload_members(self) -> None:
         """Pair each member of a declared overload set with its definition.
 
-        ``_link_declarations`` pairs a declared set with a defined one by their
-        representatives; the members pair here by parameter count and types
-        (``pair_overloads``), so each declaration records its definition, even
-        when the source defines one plain-id member. The definition also admits
-        the defaults its declaration writes: C++ writes them on the header
-        declaration only, so ``f(int, int)`` alone would refuse the one-argument
-        call ``f(int, int = 0)`` admits.
+        Outside C, C++ and Objective-C, ``_link_declarations`` pairs a declared
+        set with a defined one by their representatives; the members pair here
+        by parameter count and types (``pair_overloads``), so each declaration
+        records its definition, even when the source defines one plain-id
+        member. The C family pairs member by member there already. Either way
+        the definition also admits the defaults its declaration writes: C++
+        writes them on the header declaration only, so ``f(int, int)`` alone
+        would refuse the one-argument call ``f(int, int = 0)`` admits.
         """
         symbols = self._symbols_by_id
         for declared, defined in list(self._decl_to_def.items()):
             declared_members = self._overload_members.get(declared, ())
-            if not declared_members:
+            if not declared_members or symbols[declared].language in C_LINKAGE_LANGUAGES:
                 continue
             defined_members = self._overload_members.get(defined, ())
             pairs = pair_overloads(
@@ -469,6 +624,39 @@ class OverloadSelectionMixin:
                 del self._decl_to_def[declared]
             if defined_members:
                 self._carry_declared_floors(defined, declared_members, pairs)
+        self._carry_member_floors()
+
+    def _carry_member_floors(self) -> None:
+        """Carry each C-family declared set's defaults onto the sets it pairs with.
+
+        Walked by set rather than by link, so a set whose first member has no
+        definition still lends its other members' defaults.
+        """
+        for rep, declared_members in list(self._overload_members.items()):
+            if self._symbols_by_id[rep].language not in C_LINKAGE_LANGUAGES:
+                continue
+            by_defined: dict[str, dict[str, str]] = defaultdict(dict)
+            for member, _ in declared_members:
+                target = self._decl_to_def.get(member)
+                if target is not None:
+                    by_defined[self._overload_rep.get(target, target)][member] = target
+            for defined, pairs in by_defined.items():
+                if defined in self._overload_members:
+                    self._carry_declared_floors(defined, declared_members, pairs)
+
+    def _paired_member(self, decl: Symbol, decl_index: str, members: list[Symbol]) -> str | None:
+        """The member of one definition set that C-family prototype *decl* declares.
+
+        A lone definition of a lone prototype pairs by name, as it always has.
+        Otherwise the parameter lists pair the way a declared set pairs with a
+        defined one (``pair_overloads``).
+        """
+        if len(members) == 1 and decl.id not in self._overload_rep:
+            return members[0].id
+        declared = [self._symbols_by_id[m] for m, _ in self._overload_members.get(decl_index, ())]
+        if all(sym.id != decl.id for sym in declared):
+            declared.append(decl)
+        return pair_overloads(declared, members).get(decl.id)
 
     def _carry_declared_floors(
         self,
@@ -497,20 +685,47 @@ class OverloadSelectionMixin:
         variants = self._variant_siblings.get(resolved.callee_id, (resolved.callee_id,))
         return (resolved.caller_id,) if resolved.caller_id in variants else variants
 
+    def _refuses_recursion(self, sym_id: str | None, caller_id: str, call: CallSite) -> bool:
+        """Is *sym_id* the caller itself, with nothing to prove the call recursion?
+
+        Proof is a function that alone answers to its id and can take the
+        arguments. Otherwise the call may mean a twin of the id (an explicit
+        interface member, a generic or trait overload) or an inherited
+        overload, so an own-scope tier declines it as it always has.
+        """
+        if sym_id != caller_id:
+            return False
+        caller = self._symbols_by_id.get(caller_id)
+        return (
+            caller is None
+            or caller.kind not in _FUNCTION_KINDS
+            or caller_id in self._shared_ids
+            or not _could_recurse(caller, call.argument_count)
+        )
+
     def _narrow_overload(self, resolved: ResolvedCall, call: CallSite) -> ResolvedCall | None:
         """Move an edge on an overload set onto the member its arguments call.
 
         Every tier answers with the set's representative; this is the one place
-        a member is chosen (``_overload_target``). An overload calling itself is
-        recursion, which draws no edge.
+        a member is chosen (``_overload_target``). Landing on the caller is
+        recursion only when the arguments pick it and the site reads as a call
+        to itself; a fallback onto it is no edge.
         """
         rep = self._overload_rep.get(resolved.callee_id)
         if rep is None:
             return self._inherited_overload(resolved, call)
         target = self._overload_target(rep, call.argument_count, call.argument_types)
-        if target == resolved.caller_id:
+        if target == resolved.caller_id and not self._picks_itself(rep, target, call):
             return None
         return resolved if target == resolved.callee_id else replace(resolved, callee_id=target)
+
+    def _picks_itself(self, rep: str, caller_id: str, call: CallSite) -> bool:
+        """Do the arguments pick the caller from its own set, at a site that reads as recursion?"""
+        if caller_id != self._pick_overload(rep, call.argument_count, call.argument_types):
+            return False
+        if self._refuses_recursion(caller_id, caller_id, call):
+            return False
+        return self._site_shows_recursion(call)
 
     def _inherited_overload(self, resolved: ResolvedCall, call: CallSite) -> ResolvedCall | None:
         """A Java callee that cannot take the call's arguments yields to an inherited overload.
@@ -633,10 +848,13 @@ class OverloadSelectionMixin:
         if self._symbols_by_id[found[0]].language == "csharp":
             return self._csharp_takers(found, argument_types)
         typed = [(m, erased_parameter_types(self._symbols_by_id[m])) for m in found]
-        if self._symbols_by_id[found[0]].language == "apex":
+        language = self._symbols_by_id[found[0]].language
+        if language == "apex":
             closest = _exact_apex_fit(typed, argument_types, self._folded_type_names())
+        elif language == "kotlin":
+            closest = _exact_kotlin_fit(typed, argument_types)
         else:
-            closest = _closest_fit(typed, argument_types, expanded)
+            closest = _closest_fit(typed, argument_types, expanded, self._jvm_lambda_type_map())
         return found if closest is None else [closest]
 
     def _csharp_takers(self, found: list[str], argument_types: tuple[str | None, ...]) -> list[str]:
@@ -739,6 +957,16 @@ class OverloadSelectionMixin:
         }
         paths = {self._symbol_paths_by_id[c] for c in classes}
         return "converts" if any("operator" in self._text_of(p) for p in paths) else "value"
+
+    def _jvm_lambda_type_map(self) -> dict[str, bool]:
+        """{repository JVM type name: whether a type of that name is an interface}, built once."""
+        if self._jvm_lambda_types is None:
+            kinds: dict[str, bool] = {}
+            for symbol in self._symbols_by_id.values():
+                if symbol.language in ("java", "kotlin") and symbol.kind in _TYPE_KINDS:
+                    kinds[symbol.name] = kinds.get(symbol.name, False) or symbol.kind == "interface"
+            self._jvm_lambda_types = kinds
+        return self._jvm_lambda_types
 
     def _folded_type_names(self) -> frozenset[str]:
         """The repository's Apex type names, lowercased, built once."""
@@ -858,6 +1086,7 @@ class OverloadSelectionMixin:
 
         The tiers answer such a call with the set's representative, which is
         refused as recursion when the caller is that representative itself.
+        The caller itself is left to the tiers, which judge its site.
         """
         caller_id = call.caller_symbol_id or ""
         rep = self._overload_rep.get(caller_id)

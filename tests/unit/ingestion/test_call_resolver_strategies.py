@@ -455,6 +455,140 @@ class TestFieldTypedReceiver:
         )
         assert not [e for e in _edges(parsed, tmp_path) if e[3].startswith("receiver_field_")]
 
+    @pytest.mark.parametrize(
+        "member",
+        [
+            "public Box Rules { get; } = new Box();",
+            "public Box Rules => _box;",
+            "private readonly Box Rules;",
+        ],
+    )
+    def test_a_csharp_pascal_case_member_types_its_receiver(
+        self, tmp_path: Path, member: str
+    ) -> None:
+        """``Rules.Add(1)``: no type is named ``Rules``, so the property is the receiver."""
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "V.cs": (
+                    "csharp",
+                    f"class V\n{{\n    {member}\n    void Run() {{ Rules.Add(1); }}\n}}\n",
+                ),
+                "Box.cs": ("csharp", "public class Box\n{\n    public void Add(int x) { }\n}\n"),
+            },
+        )
+        assert ("V.cs::V::Run", "Box.cs::Box::Add", 0.75, "receiver_field_global") in _edges(
+            parsed, tmp_path
+        )
+
+    def test_a_csharp_type_of_the_receiver_s_name_still_wins(self, tmp_path: Path) -> None:
+        """A static ``Rules.Add`` the repo declares is read before the property."""
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "V.cs": (
+                    "csharp",
+                    "class V\n{\n    public Box Rules { get; }\n"
+                    "    void Run() { Rules.Add(1); }\n}\n",
+                ),
+                "Box.cs": ("csharp", "public class Box\n{\n    public void Add(int x) { }\n}\n"),
+                "Rules.cs": (
+                    "csharp",
+                    "public static class Rules\n{\n    public static void Add(int x) { }\n}\n",
+                ),
+            },
+        )
+        callees = {e[1] for e in _edges(parsed, tmp_path) if e[0] == "V.cs::V::Run"}
+        assert callees == {"Rules.cs::Rules::Add"}
+
+    def test_a_csharp_property_an_ancestor_declares(self, tmp_path: Path) -> None:
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "V.cs": ("csharp", "class V : Base\n{\n    void Run() { Rules.Add(1); }\n}\n"),
+                "Base.cs": (
+                    "csharp",
+                    "abstract class Base\n{\n    protected Box Rules { get; set; }\n}\n",
+                ),
+                "Box.cs": ("csharp", "public class Box\n{\n    public void Add(int x) { }\n}\n"),
+            },
+        )
+        resolver = CallResolver(
+            parsed,
+            {p: set() for p in parsed},
+            repo_path=str(tmp_path),
+            heritage_parents={"V.cs::V": {"Base.cs::Base"}},
+        )
+        edges = [
+            (rc.callee_id, rc.origin) for rc in resolver.resolve_file("V.cs", parsed["V.cs"].calls)
+        ]
+        assert edges == [("Box.cs::Box::Add", "receiver_field_global")]
+
+    def test_a_capitalised_receiver_no_member_names_gets_no_edge(self, tmp_path: Path) -> None:
+        """``Console.WriteLine`` is the BCL's, whatever repo class has a ``WriteLine``."""
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "V.cs": ("csharp", "class V\n{\n    void Run() { Console.WriteLine(1); }\n}\n"),
+                "Box.cs": ("csharp", "public class Box\n{\n    public void WriteLine(int x) { }\n}\n"),
+            },
+        )
+        assert not [e for e in _edges(parsed, tmp_path) if e[0] == "V.cs::V::Run"]
+
+    @pytest.mark.parametrize(
+        "holder",
+        [
+            "void Run()\n    {\n        Result Check = Compute();\n    }",
+            "public int P\n    {\n        get\n        {\n            Result Check = Compute();\n"
+            "            return 1;\n        }\n    }",
+            "Action A = () =>\n    {\n        Result Check = Compute();\n    };",
+        ],
+        ids=["method", "accessor", "lambda"],
+    )
+    def test_a_csharp_body_local_types_no_receiver_elsewhere(
+        self, tmp_path: Path, holder: str
+    ) -> None:
+        """``Result Check = ..`` inside a body is that body's local, not a field."""
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "V.cs": ("csharp", f"class V\n{{\n    {holder}\n    void Other() {{ Check.Go(); }}\n}}\n"),
+                "Result.cs": ("csharp", "public class Result\n{\n    public void Go() { }\n}\n"),
+            },
+        )
+        assert not [e for e in _edges(parsed, tmp_path) if e[1] == "Result.cs::Result::Go"]
+
+    def test_a_csharp_field_beside_an_accessor_local_still_types(self, tmp_path: Path) -> None:
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "V.cs": (
+                    "csharp",
+                    "namespace N\n{\n    record V\n    {\n        Result Check = Compute();\n"
+                    "        public int P { get { Other Check = null; return 1; } }\n"
+                    "        void Run() { Check.Go(); }\n    }\n}\n",
+                ),
+                "Result.cs": ("csharp", "public class Result\n{\n    public void Go() { }\n}\n"),
+            },
+        )
+        assert [e[0] for e in _edges(parsed, tmp_path) if e[1] == "Result.cs::Result::Go"] == [
+            "V.cs::V::Run"
+        ]
+
+    def test_a_capitalised_parameter_shadows_the_property(self, tmp_path: Path) -> None:
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "V.cs": (
+                    "csharp",
+                    "class V\n{\n    public Box Rules { get; }\n"
+                    "    void Run(Other Rules) { Rules.Add(1); }\n}\n",
+                ),
+                "Box.cs": ("csharp", "public class Box\n{\n    public void Add(int x) { }\n}\n"),
+            },
+        )
+        assert not [e for e in _edges(parsed, tmp_path) if e[1] == "Box.cs::Box::Add"]
+
     def test_a_kotlin_constructor_property_types_its_receiver(self, tmp_path: Path) -> None:
         """Hilt's `@Inject constructor(private val api: Api)`, read bare and through `this`."""
         parsed = _parse_all(
@@ -1476,6 +1610,107 @@ class TestInheritedTypedReceiver:
         assert self._targets(tmp_path, files, parents, language="kotlin") == []
 
 
+class TestJavaUnnamedObjectCall:
+    """``a.b.m()`` keeps only a bare site, which repo-wide uniqueness alone may bind."""
+
+    _OTHER = "package p;\npublic class Other {\n    public void m(int x) {}\n}\n"
+
+    def _targets(
+        self,
+        tmp_path: Path,
+        body: str,
+        other: str | None = None,
+        *,
+        base: str | None = None,
+        heritage: bool = True,
+    ) -> list[str]:
+        """Callees of ``Use.go``; a *base* body puts ``p.Base`` above ``Use``."""
+        extends = "" if base is None else " extends Base"
+        files = {
+            "p/Use.java": f"package p;\nimport p.Other;\nclass Use{extends} {{\n    Holder a;\n"
+            f"    void m(int x) {{}}\n    void go() {{\n        {body}\n    }}\n}}\n",
+            "p/Other.java": self._OTHER if other is None else other,
+        }
+        parents: dict[str, set[str]] = {}
+        if base is not None:
+            files["p/Base.java"] = f"package p;\npublic class Base {{\n{base}\n}}\n"
+            if heritage:
+                parents["p/Use.java::Use"] = {"p/Base.java::Base"}
+        parsed = _parse_all(tmp_path, {k: ("java", v) for k, v in files.items()})
+        graph = {k: set() for k in parsed} | {"p/Use.java": {"p/Other.java"}}
+        resolver = CallResolver(parsed, graph, repo_path=str(tmp_path), heritage_parents=parents)
+        calls = parsed["p/Use.java"].calls
+        return sorted(rc.callee_id for rc in resolver.resolve_file("p/Use.java", calls))
+
+    @pytest.mark.parametrize("receiver", ["a.b", "X.CONST", "\"s\"", "arr[0]"])
+    def test_a_name_two_classes_declare_is_not_the_callers_own(
+        self, tmp_path: Path, receiver: str
+    ) -> None:
+        assert self._targets(tmp_path, f"{receiver}.m(1);") == []
+
+    @pytest.mark.parametrize("name", ["only", "get", "isBlank"])
+    def test_a_repo_wide_unique_name_still_binds(self, tmp_path: Path, name: str) -> None:
+        other = f"package p;\npublic class Other {{\n    public void {name}() {{}}\n}}\n"
+        assert self._targets(tmp_path, f"a.b.{name}();", other) == [f"p/Other.java::Other::{name}"]
+
+    @pytest.mark.parametrize("body", ["a.b.contains(x);", "Map.class.isAssignableFrom(x);"])
+    def test_a_unique_repo_method_named_like_a_jdk_one_does_not_bind(
+        self, tmp_path: Path, body: str
+    ) -> None:
+        """``a.b.contains(x)`` is a collection's ``contains`` far more often than the repo's one."""
+        name = body.split(".")[-1].split("(")[0]
+        other = (
+            f"package p;\npublic class Other {{\n"
+            f"    public boolean {name}(Object o) {{ return true; }}\n}}\n"
+        )
+        assert self._targets(tmp_path, body, other) == []
+
+    @pytest.mark.parametrize("body", ["m(1); a.b.m(2);", "a.b.m(2); m(1);"], ids=["bare-first", "bare-last"])
+    def test_a_bare_call_beside_it_keeps_every_tier(self, tmp_path: Path, body: str) -> None:
+        assert self._targets(tmp_path, body) == ["p/Use.java::Use::m"]
+
+    def test_a_this_call_keeps_the_callers_class(self, tmp_path: Path) -> None:
+        """``this`` is a named receiver, so ``Other.m`` is no rival of the caller's own."""
+        assert self._targets(tmp_path, "this.m(1);") == ["p/Use.java::Use::m"]
+
+    def test_a_local_of_the_callers_type_binds_through_its_type(self, tmp_path: Path) -> None:
+        """A named receiver resolves by its type before ``Other.m`` is weighed."""
+        assert self._targets(tmp_path, "Use u = this; u.m(1);") == ["p/Use.java::Use::m"]
+
+    def test_super_binds_the_superclass_method_in_another_file(self, tmp_path: Path) -> None:
+        base = "    void m(int x) {}"
+        assert self._targets(tmp_path, "super.m(1);", base=base) == ["p/Base.java::Base::m"]
+
+    def test_super_without_heritage_data_binds_nothing(self, tmp_path: Path) -> None:
+        """``super`` never falls to a bare-name tier, so ``Use.m`` and ``Other.m`` stay out."""
+        base = "    void m(int x) {}"
+        assert self._targets(tmp_path, "super.m(1);", base=base, heritage=False) == []
+
+    @pytest.mark.parametrize(
+        ("body", "flagged"),
+        [
+            ("a.b.m(1);", True),
+            ("m(1);", False),
+            ("Use.this.m(1);", False),
+            ("a.m(1);", True),
+            ("this.m(1);", True),
+            ("super.m(1);", True),
+        ],
+        ids=["field-path", "bare", "qualified-this", "named-receiver", "this", "super"],
+    )
+    def test_only_an_unnamed_object_is_flagged(
+        self, tmp_path: Path, body: str, flagged: bool
+    ) -> None:
+        source = f"class Use {{\n    void go() {{\n        {body}\n    }}\n}}\n"
+        (call,) = _parse_all(tmp_path, {"Use.java": ("java", source)})["Use.java"].calls
+        # A named receiver's bare twin is folded into it as ``bare_name_fallback``,
+        # a fallback reading; only the receiver-less flag marks an unnamed object.
+        assert call.bare_name_fallback is flagged
+        named = ("a.m(1);", "this.m(1);", "super.m(1);")
+        assert (call.receiver_name is None) is (body not in named)
+        assert call.on_unnamed_object is (body == "a.b.m(1);")
+
+
 class TestJavaReceiverRecall:
     """Java receivers the typed tiers missed: an inherited field, ``super``, a cast."""
 
@@ -2059,7 +2294,7 @@ class TestModuleAliasReachesTopLevelOnly:
                 ),
             },
         )
-        _link_imports(parsed, {"Caller.cs": {"S": "Shapes.cs"}})
+        _link_imports(parsed, {"Caller.cs": {"N.Shape": "Shapes.cs"}})
         import_targets = {"Caller.cs": {"Shapes.cs"}, "Shapes.cs": set()}
         assert (
             "Caller.cs::Caller::Run",
@@ -2773,6 +3008,107 @@ class TestJsBareCallSkipsClassMembers:
             0.95,
             "self_scope",
         ) in _edges(parsed, tmp_path)
+
+
+class TestJavaStaticImport:
+    def test_a_static_import_binds_the_member_of_the_named_type(self, tmp_path: Path) -> None:
+        """``import static a.Ex.afterCommit`` means ``Ex.afterCommit``, not a nested type's one."""
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "a/Ex.java": (
+                    "java",
+                    "package a;\npublic class Ex {\n"
+                    "  public static void afterCommit(Runnable r) { r.run(); }\n"
+                    "  private static class Sync {\n"
+                    "    private void afterCommit(Runnable r) { }\n  }\n}\n",
+                ),
+                "b/User.java": (
+                    "java",
+                    "package b;\nimport static a.Ex.afterCommit;\npublic class User {\n"
+                    "  void go(Runnable r) { afterCommit(r); }\n}\n",
+                ),
+            },
+        )
+        _link_imports(parsed, {"b/User.java": {"a.Ex.afterCommit": "a/Ex.java"}})
+        callees = {
+            callee
+            for src, callee, _, _ in _edges(parsed, tmp_path, {"b/User.java": {"a/Ex.java"}})
+            if src == "b/User.java::User::go"
+        }
+        assert callees == {"a/Ex.java::Ex::afterCommit"}
+
+    def test_a_static_import_of_a_nested_type_member_binds_that_type(self, tmp_path: Path) -> None:
+        """``import static a.Ex.Sync.flush`` names the nested type's member, not the outer one's."""
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "a/Ex.java": (
+                    "java",
+                    "package a;\npublic class Ex {\n"
+                    "  public static class Sync {\n"
+                    "    public static void flush() { }\n  }\n"
+                    "  public static void flush() { }\n}\n",
+                ),
+                "b/User.java": (
+                    "java",
+                    "package b;\nimport static a.Ex.Sync.flush;\npublic class User {\n"
+                    "  void go() { flush(); }\n}\n",
+                ),
+            },
+        )
+        _link_imports(parsed, {"b/User.java": {"a.Ex.Sync.flush": "a/Ex.java"}})
+        callees = {
+            callee
+            for src, callee, _, _ in _edges(parsed, tmp_path, {"b/User.java": {"a/Ex.java"}})
+            if src == "b/User.java::User::go"
+        }
+        assert callees == {"a/Ex.java::Sync::flush"}
+
+
+class TestPythonLocalShadowsModuleClass:
+    """A Python local of a module-level class's name hides that class.
+
+    Regression test for #4843: the binding scan only recorded lowercase
+    names, so `C = make()` inside a function never shadowed `class C`.
+    """
+
+    _EDGE = ("m.py::f", "m.py::C", 0.95, "same_file")
+
+    def _edges_for(self, tmp_path: Path, body: str) -> list[tuple[str, str, float, str]]:
+        parsed = _parse_all(
+            tmp_path,
+            {"m.py": ("python", "class C:\n    pass\n\n" + body)},
+        )
+        return _edges(parsed, tmp_path)
+
+    def test_plain_assignment_shadows_the_class(self, tmp_path: Path) -> None:
+        assert self._EDGE not in self._edges_for(
+            tmp_path, "def f():\n    C = make()\n    C()\n"
+        )
+
+    def test_for_target_shadows_the_class(self, tmp_path: Path) -> None:
+        assert self._EDGE not in self._edges_for(
+            tmp_path, "def f():\n    for C in xs:\n        C()\n"
+        )
+
+    def test_with_as_shadows_the_class(self, tmp_path: Path) -> None:
+        assert self._EDGE not in self._edges_for(
+            tmp_path, "def f():\n    with open('x') as C:\n        C()\n"
+        )
+
+    def test_parameter_shadows_the_class(self, tmp_path: Path) -> None:
+        assert self._EDGE not in self._edges_for(tmp_path, "def f(C):\n    C()\n")
+
+    def test_binding_in_another_function_does_not_shadow(
+        self, tmp_path: Path
+    ) -> None:
+        assert self._EDGE in self._edges_for(
+            tmp_path, "def g():\n    C = make()\n\ndef f():\n    C()\n"
+        )
+
+    def test_no_local_binding_keeps_the_edge(self, tmp_path: Path) -> None:
+        assert self._EDGE in self._edges_for(tmp_path, "def f():\n    C()\n")
 
 
 _PY_GO_RS = [
